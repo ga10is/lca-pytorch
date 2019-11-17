@@ -27,7 +27,15 @@ def get_transforms(mode):
     return transforms
 
 
-def train():
+def train(lca_freq):
+    """
+    Training
+
+    Parameters
+    ----------
+    lca_freq: int
+        Frequency of calculating LCA
+    """
 
     epochs = 1
 
@@ -56,20 +64,19 @@ def train():
 
             logit = model(img)
             loss = criterion(logit, label)
-
             loss.backward()
 
-            # set previous parameter(theta)
-            lca.set_prev_theta(model)
+            if i % lca_freq == 0:
+                # set previous parameter(theta(t))
+                lca.set_prev_theta(model)
+                optimizer.step()
+                # set current parameter(theta(t+1))
+                lca.set_cur_theta(model)
 
-            optimizer.step()
-
-            # set current parameter(theta+1)
-            lca.set_cur_theta(model)
-
-            return lca.calc_grad(model, criterion, img, label)
-
-            break
+                lca_dict = lca.calc_grad(model, criterion, img, label)
+                plot_lca(lca_dict)
+            else:
+                optimizer.step()
 
         # valid one epoch
 
@@ -77,6 +84,9 @@ def train():
 
 
 class Lca:
+    # TODO: introduce with
+    # with lca.set_theta():
+    #     optimizer.step()
 
     def __init__(self):
         self.theta_list = [None, None, None]
@@ -108,6 +118,29 @@ class Lca:
         self.theta_list[1] = theta_frac
 
     def calc_grad(self, model, criterion, x, y):
+        """
+        Calculate LCA for each layer.
+
+        Parameters
+        ----------
+        model: torch.nn.Module
+            model to set parameters, and calculate loss/gradient.
+        criterion: torch.nn.Module
+            loss function
+        x: torch.Tensor
+            input of model
+        y: torch.Tensor
+            output of model
+
+        Returns
+        -------
+        OrderedDict
+            key: parameter name. e.g. conv1.weight
+            vlaue: LCA for each parameter
+        """
+        # record current paramters
+        current_params = model.state_dict()
+
         lca = OrderedDict()
         coeffs = [1, 4, 1]
 
@@ -119,17 +152,13 @@ class Lca:
             # set parameter to model
             model.load_state_dict(theta)
 
-            # zero_grad
             model.zero_grad()
-
             logit = model(x)
             loss = criterion(logit, y)
-
             loss_vals.append(loss.item())
-
-            # backward
             loss.backward()
 
+            # calculate LCA
             for n, p in model.named_parameters():
                 if n not in lca:
                     lca[n] = coeff * p.grad.data / sum(coeffs)
@@ -141,6 +170,9 @@ class Lca:
         for k, v in lca.items():
             # print(k, v)
             lca[k] *= (self.theta_list[-1][k] - self.theta_list[0][k])
+
+        # back current parameters to model parameters
+        model.load_state_dict(current_params)
 
         return lca
 
@@ -181,7 +213,7 @@ class MyNet(nn.Module):
         return x
 
 
-def plot_grad(lca_dict, figsize=(16, 6)):
+def plot_lca(lca_dict, figsize=(16, 6)):
     sum_lca = [lca_dict[k].sum().item() for k in lca_dict.keys()]
     layers = list(lca_dict.keys())
 

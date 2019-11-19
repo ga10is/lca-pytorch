@@ -1,6 +1,6 @@
 import argparse
 
-from .tvp import train, plot_lca
+from .tvp import train
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

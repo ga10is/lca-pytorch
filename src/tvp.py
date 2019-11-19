@@ -13,6 +13,8 @@ try:
 except ImportError:
     print('no matplotlib')
 
+from .db.mstory import ModelDB
+
 
 def get_transforms(mode):
 
@@ -50,14 +52,16 @@ def train(lca_freq):
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
     criterion = torch.nn.CrossEntropyLoss()
 
+    lca = Lca(model, criterion)
+    db = ModelDB('./sample.db')
+    db.rec_model(model, './some_path/')
+
     # train
     model.train()
     for epoch in range(1, epochs + 1):
         # train one epoch
         for i, data in enumerate(tqdm(train_loader)):
             # train one iteration
-            lca = Lca()
-
             img, label = data
 
             optimizer.zero_grad()
@@ -68,13 +72,14 @@ def train(lca_freq):
 
             if i % lca_freq == 0:
                 # set previous parameter(theta(t))
-                lca.set_prev_theta(model)
+                lca.set_cur_theta(model)
                 optimizer.step()
                 # set current parameter(theta(t+1))
-                lca.set_cur_theta(model)
+                lca.set_next_theta(model)
 
-                lca_dict = lca.calc_grad(model, criterion, img, label)
-                plot_lca(lca_dict)
+                lca_dict = lca.calc_grad(img, label)
+                db.rec_lca(lca_dict, epoch, i)
+                # plot_lca(lca_dict)
             else:
                 optimizer.step()
 
@@ -88,21 +93,31 @@ class Lca:
     # with lca.set_theta():
     #     optimizer.step()
 
-    def __init__(self):
+    def __init__(self, model, criterion):
+        """
+        Parameters
+        ----------
+        model_org: torch.nn.Module
+            model to set parameters, and calculate loss/gradient.
+        criterion: torch.nn.Module
+            loss function
+        """
+        self.model = copy.deepcopy(model)
+        self.criterion = copy.deepcopy(criterion)
         self.theta_list = [None, None, None]
 
-    def set_prev_theta(self, model):
+    def set_cur_theta(self, model):
         # name_param_dict = OrderedDict()
         # for n, p in model.named_parameters():
         # name_param_dict[n] = p.data
         self.theta_list[0] = copy.deepcopy(model.state_dict(keep_vars=False))
 
-    def set_cur_theta(self, model):
+    def set_next_theta(self, model):
         self.theta_list[-1] = copy.deepcopy(model.state_dict(keep_vars=False))
 
     def set_fractional_theta(self):
         if self.theta_list[0] is None:
-            raise ValueError('Previous parameters must be set')
+            raise ValueError('Current parameters must be set')
         if self.theta_list[-1] is None:
             raise ValueError('Current parameters must be set')
 
@@ -110,23 +125,19 @@ class Lca:
         for (n1, p1), (n2, p2) in zip(self.theta_list[0].items(), self.theta_list[-1].items()):
             if n1 != n2:
                 raise ValueError(
-                    'Names of previous and current parameter are different')
+                    'Names of current and next parameter are different')
             # 1/2 theta_t + 1/2 theta_(t+1)
             # theta_frac[n1] = torch.add(p1.data, p2.data) / 2
             theta_frac[n1] = (p1.data + p2.data) / 2
 
         self.theta_list[1] = theta_frac
 
-    def calc_grad(self, model, criterion, x, y):
+    def calc_grad(self, x, y):
         """
         Calculate LCA for each layer.
 
         Parameters
         ----------
-        model: torch.nn.Module
-            model to set parameters, and calculate loss/gradient.
-        criterion: torch.nn.Module
-            loss function
         x: torch.Tensor
             input of model
         y: torch.Tensor
@@ -138,8 +149,6 @@ class Lca:
             key: parameter name. e.g. conv1.weight
             vlaue: LCA for each parameter
         """
-        # record current paramters
-        current_params = model.state_dict()
 
         lca = OrderedDict()
         coeffs = [1, 4, 1]
@@ -150,16 +159,16 @@ class Lca:
         loss_vals = []
         for theta, coeff in zip(self.theta_list, coeffs):
             # set parameter to model
-            model.load_state_dict(theta)
+            self.model.load_state_dict(theta)
 
-            model.zero_grad()
-            logit = model(x)
-            loss = criterion(logit, y)
+            self.model.zero_grad()
+            logit = self.model(x)
+            loss = self.criterion(logit, y)
             loss_vals.append(loss.item())
             loss.backward()
 
             # calculate LCA
-            for n, p in model.named_parameters():
+            for n, p in self.model.named_parameters():
                 if n not in lca:
                     lca[n] = coeff * p.grad.data / sum(coeffs)
                 else:
@@ -170,9 +179,6 @@ class Lca:
         for k, v in lca.items():
             # print(k, v)
             lca[k] *= (self.theta_list[-1][k] - self.theta_list[0][k])
-
-        # back current parameters to model parameters
-        model.load_state_dict(current_params)
 
         return lca
 

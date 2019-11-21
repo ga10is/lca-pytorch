@@ -29,6 +29,9 @@ def get_transforms(mode):
     return transforms
 
 
+DEVICE = torch.device("cuda:0")
+
+
 def train(lca_freq):
     """
     Training
@@ -38,23 +41,30 @@ def train(lca_freq):
     lca_freq: int
         Frequency of calculating LCA
     """
-
-    epochs = 1
+    epochs = 20
 
     # load dataset
+    # TODO: change valid -> train
     train_dataset = torchvision.datasets.CIFAR10(
         root='./data', train=True, download=True, transform=get_transforms('train'))
     train_loader = DataLoader(
-        train_dataset, batch_size=128, shuffle=False, num_workers=4)
+        train_dataset, batch_size=128, shuffle=True, num_workers=8, drop_last=True)
 
     # init model
-    model = MyNet()
+    model = ResNet().to(DEVICE)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
     criterion = torch.nn.CrossEntropyLoss()
 
     lca = Lca(model, criterion)
+    lca_dataset = torchvision.datasets.CIFAR10(
+        root='./data', train=False, download=True, transform=get_transforms('train'))
+    lca_loader = DataLoader(lca_dataset, batch_size=128,
+                            shuffle=True, num_workers=8, drop_last=True)
     db = ModelDB('./sample.db')
     db.rec_model(model, './some_path/')
+
+    # lr
+    lr = optimizer.state_dict()['param_groups'][0]['lr']
 
     # train
     model.train()
@@ -63,6 +73,7 @@ def train(lca_freq):
         for i, data in enumerate(tqdm(train_loader)):
             # train one iteration
             img, label = data
+            img, label = img.to(DEVICE), label.to(DEVICE)
 
             optimizer.zero_grad()
 
@@ -70,14 +81,18 @@ def train(lca_freq):
             loss = criterion(logit, label)
             loss.backward()
 
-            if i % lca_freq == 0:
+            # record history
+            db.rec_history(epoch, i, 'train', img.size(0), lr, loss.item(), 0)
+            print('loss: %.6f' % (loss.item(),))
+
+            if (i + 1) % lca_freq == 0:
                 # set previous parameter(theta(t))
                 lca.set_cur_theta(model)
                 optimizer.step()
                 # set current parameter(theta(t+1))
                 lca.set_next_theta(model)
 
-                lca_dict = lca.calc_grad(img, label)
+                lca_dict = lca.calc_grad(lca_loader)
                 db.rec_lca(lca_dict, epoch, i)
                 # plot_lca(lca_dict)
             else:
@@ -132,7 +147,7 @@ class Lca:
 
         self.theta_list[1] = theta_frac
 
-    def calc_grad(self, x, y):
+    def calc_grad(self, loader):
         """
         Calculate LCA for each layer.
 
@@ -156,31 +171,79 @@ class Lca:
         # set 1/2 theta_t + 1/2 theta_(t+1)
         self.set_fractional_theta()
 
-        loss_vals = []
-        for theta, coeff in zip(self.theta_list, coeffs):
+        n_batches = len(loader)
+        # record loss change
+        # L(theta_t): loss_vals[i, 0], L(theta_(t+1)): loss_vals[i, -1]
+        loss_vals = np.zeros((n_batches, 3))
+
+        self.model.eval()
+        for idx, (theta, coeff) in enumerate(zip(self.theta_list, coeffs)):
             # set parameter to model
             self.model.load_state_dict(theta)
 
             self.model.zero_grad()
-            logit = self.model(x)
-            loss = self.criterion(logit, y)
-            loss_vals.append(loss.item())
-            loss.backward()
+            for b_idx, data in enumerate(loader):
+                img, label = data
+                img, label = img.to(DEVICE), label.to(DEVICE)
+
+                logit = self.model(img)
+                loss = self.criterion(logit, label)
+                # accumulate gradient
+                loss.backward()
+
+                loss_vals[b_idx, idx] = loss.item()
 
             # calculate LCA
+            # coeff * delta_L(theta) / 6 / n_repeats
             for n, p in self.model.named_parameters():
                 if n not in lca:
-                    lca[n] = coeff * p.grad.data / sum(coeffs)
+                    lca[n] = coeff * p.grad.data / sum(coeffs) / n_batches
                 else:
-                    lca[n] += coeff * p.grad.data / sum(coeffs)
+                    lca[n] += coeff * p.grad.data / sum(coeffs) / n_batches
 
-        print(loss_vals[-1] - loss_vals[0])
+        loss_change = (loss_vals[:, -1] - loss_vals[:, 0]).mean(axis=0)
+        print('loss change: %.6f' % loss_change)
 
+        # inner product <delta_L(theta), theta_(t+1) - theta_t>
         for k, v in lca.items():
-            # print(k, v)
             lca[k] *= (self.theta_list[-1][k] - self.theta_list[0][k])
 
         return lca
+
+
+class ResNet(nn.Module):
+    def __init__(self):
+        super(ResNet, self).__init__()
+        resnet = torchvision.models.resnet18(pretrained=False)
+        self.conv1 = resnet.conv1
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
+
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(512, 10)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = F.relu(x)
+        x = self.avg_pool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+
+        return x
 
 
 class MyNet(nn.Module):

@@ -1,8 +1,8 @@
-import copy
-from collections import OrderedDict
-
-import torch
 import numpy as np
+import torch
+from collections import OrderedDict
+import copy
+import contextlib
 
 
 class Lca:
@@ -48,6 +48,21 @@ class Lca:
             theta_frac[n1] = (p1.data + p2.data) / 2
 
         self.theta_list[1] = theta_frac
+
+    @contextlib.contextmanager
+    def watch_param_change(self, model):
+        """
+        Watch the model parameter's change during optimizer.step()
+
+        Usage
+        -----
+        with lca.watch_param_change(model):
+            optimizer.step()
+        lca_dict = lca.calc_grad(loader)
+        """
+        self.set_cur_theta(model)
+        yield
+        self.set_next_theta(model)
 
     def calc_grad(self, loader):
         """

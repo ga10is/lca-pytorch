@@ -5,7 +5,7 @@ import copy
 import torch
 import torch.nn as nn
 import torchvision
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 import numpy as np
 try:
     import matplotlib.pylab as plt
@@ -14,6 +14,7 @@ except ImportError:
     print('no matplotlib')
 
 from .db.mstory import ModelDB
+from .model.metrics import AverageMeter, accuracy
 
 
 def get_transforms(mode):
@@ -27,6 +28,19 @@ def get_transforms(mode):
             )
         ])
     return transforms
+
+
+class LcaDataset(Dataset):
+    def __init__(self, data_size):
+        self.data_size = data_size
+        self.dataset = torchvision.datasets.CIFAR10(
+            root='./data', train=False, download=True, transform=get_transforms('train'))
+
+    def __len__(self):
+        return self.data_size
+
+    def __getitem__(self, idx):
+        return self.dataset[idx]
 
 
 DEVICE = torch.device("cuda:0")
@@ -56,10 +70,9 @@ def train(lca_freq):
     criterion = torch.nn.CrossEntropyLoss()
 
     lca = Lca(model, criterion)
-    lca_dataset = torchvision.datasets.CIFAR10(
-        root='./data', train=False, download=True, transform=get_transforms('train'))
+    lca_dataset = LcaDataset(1000)
     lca_loader = DataLoader(lca_dataset, batch_size=128,
-                            shuffle=True, num_workers=8, drop_last=True)
+                            shuffle=True, num_workers=8, drop_last=False)
     db = ModelDB('./sample.db')
     db.rec_model(model, './some_path/')
 
@@ -69,6 +82,9 @@ def train(lca_freq):
     # train
     model.train()
     for epoch in range(1, epochs + 1):
+        loss_meter = AverageMeter()
+        acc_meter = AverageMeter()
+
         # train one epoch
         for i, data in enumerate(tqdm(train_loader)):
             # train one iteration
@@ -82,10 +98,15 @@ def train(lca_freq):
             loss.backward()
 
             # record history
-            db.rec_history(epoch, i, 'train', img.size(0), lr, loss.item(), 0)
-            print('loss: %.6f' % (loss.item(),))
+            acc = accuracy(logit.detach(), label.detach())[0]
+            db.rec_history(epoch, i, 'train', img.size(0),
+                           lr, loss.item(), acc.item())
+            loss_meter.update(loss.item(), img.size(0))
+            acc_meter.update(acc.item(), img.size(0))
 
             if (i + 1) % lca_freq == 0:
+                print('loss: %.6f acc: %.6f' % (loss_meter.avg, acc_meter.avg))
+
                 # set previous parameter(theta(t))
                 lca.set_cur_theta(model)
                 optimizer.step()
@@ -142,7 +163,6 @@ class Lca:
                 raise ValueError(
                     'Names of current and next parameter are different')
             # 1/2 theta_t + 1/2 theta_(t+1)
-            # theta_frac[n1] = torch.add(p1.data, p2.data) / 2
             theta_frac[n1] = (p1.data + p2.data) / 2
 
         self.theta_list[1] = theta_frac
@@ -171,12 +191,15 @@ class Lca:
         # set 1/2 theta_t + 1/2 theta_(t+1)
         self.set_fractional_theta()
 
+        # initialize lca
+        for n, p in self.model.named_parameters():
+            lca[n] = torch.zeros(*p.size()).to(DEVICE)
+
         n_batches = len(loader)
         # record loss change
         # L(theta_t): loss_vals[i, 0], L(theta_(t+1)): loss_vals[i, -1]
         loss_vals = np.zeros((n_batches, 3))
 
-        self.model.eval()
         for idx, (theta, coeff) in enumerate(zip(self.theta_list, coeffs)):
             # set parameter to model
             self.model.load_state_dict(theta)
@@ -196,13 +219,12 @@ class Lca:
             # calculate LCA
             # coeff * delta_L(theta) / 6 / n_repeats
             for n, p in self.model.named_parameters():
-                if n not in lca:
-                    lca[n] = coeff * p.grad.data / sum(coeffs) / n_batches
-                else:
+                if p is not None and p.grad is not None:
                     lca[n] += coeff * p.grad.data / sum(coeffs) / n_batches
 
         loss_change = (loss_vals[:, -1] - loss_vals[:, 0]).mean(axis=0)
         print('loss change: %.6f' % loss_change)
+        print(loss_vals)
 
         # inner product <delta_L(theta), theta_(t+1) - theta_t>
         for k, v in lca.items():
